@@ -56,6 +56,14 @@ from watermark_engine import (
     make_video_preview_image,
     process_file,
 )
+from remove_engine import (
+    RemovalOptions,
+    describe_removal_options,
+    has_valid_region,
+    make_removal_preview_image,
+    process_removal_file,
+    valid_regions,
+)
 
 
 APP_TITLE = "智影水印 - 图片/视频批量水印"
@@ -245,6 +253,7 @@ class WatermarkApp(TkBase):
         self.preview_photo: ImageTk.PhotoImage | None = None
         self.preview_after_id: str | None = None
         self.preview_token = 0
+        self.preview_source_key: tuple[str, str] | None = None
         self.preview_zoom = 1.0
         self.preview_pan_x = 0.0
         self.preview_pan_y = 0.0
@@ -260,9 +269,23 @@ class WatermarkApp(TkBase):
         self.checkbuttons: list[Checkbutton] = []
         self.color_buttons: dict[str, Button] = {}
         self.preview_buttons: list[Button] = []
+        self.preview_tool_buttons: dict[str, Button] = {}
+        self.mode_buttons: dict[str, Button] = {}
         self.preview_toolbar_window: int | None = None
+        self._preview_image_rect: tuple[float, float, float, float] | None = None
+        self._remove_selecting = False
+        self._remove_select_start: tuple[float, float] | None = None
+        self._remove_drag_action = ""
+        self._remove_drag_start_point: tuple[float, float] | None = None
+        self._remove_drag_start_region: tuple[float, float, float, float] | None = None
+        self._remove_drag_region_index: int | None = None
+        self.remove_regions: list[tuple[float, float, float, float]] = []
+        self.active_remove_region_index: int | None = None
+        self.remove_region_history: list[tuple[tuple[float, float, float, float], ...]] = []
 
         self.theme_var = StringVar(value="dark")
+        self.operation_var = StringVar(value="watermark")
+        self.preview_tool_var = StringVar(value="select")
         self.text_var = StringVar(value="AI-Generated (Audio & Visuals)")
         self.font_path_var = StringVar(value=default_font_path())
         self.auto_size_var = BooleanVar(value=True)
@@ -288,6 +311,11 @@ class WatermarkApp(TkBase):
         self.status_var = StringVar(value="准备就绪")
         self.progress_var = DoubleVar(value=0)
         self.preset_var = StringVar(value="清晰角标")
+        self.remove_smart_mask_var = BooleanVar(value=True)
+        self.remove_sensitivity_var = IntVar(value=6)
+        self.remove_feather_var = IntVar(value=16)
+        self.remove_expand_var = IntVar(value=4)
+        self.remove_strength_var = IntVar(value=3)
 
         self._load_settings()
         self._configure_style()
@@ -331,7 +359,9 @@ class WatermarkApp(TkBase):
         return base / "WatermarkStudio" / "settings.json"
 
     def _settings_snapshot(self) -> dict[str, object]:
+        remove_regions = self._valid_remove_regions()
         return {
+            "operation": self.operation_var.get(),
             "text": self.text_var.get(),
             "font_path": self.font_path_var.get(),
             "auto_size": self.auto_size_var.get(),
@@ -356,6 +386,13 @@ class WatermarkApp(TkBase):
             "open_after": self.open_after_var.get(),
             "preset": self.preset_var.get(),
             "theme": self.theme_var.get(),
+            "remove_region": list(remove_regions[-1]) if remove_regions else None,
+            "remove_regions": [list(region) for region in remove_regions],
+            "remove_smart_mask": self.remove_smart_mask_var.get(),
+            "remove_sensitivity": self.remove_sensitivity_var.get(),
+            "remove_feather": self.remove_feather_var.get(),
+            "remove_expand": self.remove_expand_var.get(),
+            "remove_strength": self.remove_strength_var.get(),
         }
 
     def _load_settings(self) -> None:
@@ -420,6 +457,36 @@ class WatermarkApp(TkBase):
         theme = str(data.get("theme", self.theme_var.get()))
         if theme in THEMES:
             self.theme_var.set(theme)
+        operation = str(data.get("operation", self.operation_var.get()))
+        if operation in {"watermark", "remove"}:
+            self.operation_var.set(operation)
+        loaded_regions: list[tuple[float, float, float, float]] = []
+        saved_regions = data.get("remove_regions")
+        if isinstance(saved_regions, list):
+            for saved_region in saved_regions:
+                if isinstance(saved_region, list) and len(saved_region) == 4:
+                    try:
+                        region = tuple(float(value) for value in saved_region)
+                    except (TypeError, ValueError):
+                        continue
+                    if has_valid_region(region):
+                        loaded_regions.append(region)
+        if not loaded_regions:
+            region = data.get("remove_region")
+            if isinstance(region, list) and len(region) == 4:
+                try:
+                    loaded_region = tuple(float(value) for value in region)
+                except (TypeError, ValueError):
+                    loaded_region = None
+                if has_valid_region(loaded_region):
+                    loaded_regions.append(loaded_region)
+        self.remove_regions = loaded_regions
+        self.active_remove_region_index = len(loaded_regions) - 1 if loaded_regions else None
+        self.remove_smart_mask_var.set(bool(data.get("remove_smart_mask", self.remove_smart_mask_var.get())))
+        set_int(self.remove_sensitivity_var, "remove_sensitivity", 1, 10)
+        set_int(self.remove_feather_var, "remove_feather", 0, 80)
+        set_int(self.remove_expand_var, "remove_expand", 0, 80)
+        set_int(self.remove_strength_var, "remove_strength", 1, 6)
 
     def _save_settings(self) -> None:
         try:
@@ -457,9 +524,20 @@ class WatermarkApp(TkBase):
         self.open_after_var.set(False)
         self.preset_var.set("清晰角标")
         self.theme_var.set("dark")
+        self.operation_var.set("watermark")
+        self.remove_regions = []
+        self.active_remove_region_index = None
+        self.remove_region_history = []
+        self.remove_smart_mask_var.set(True)
+        self.remove_sensitivity_var.set(6)
+        self.remove_feather_var.set(16)
+        self.remove_expand_var.set(4)
+        self.remove_strength_var.set(3)
         self._refresh_color_swatches()
         self._apply_theme()
         self._refresh_ffmpeg_badge()
+        self._refresh_mode_buttons()
+        self._refresh_settings_visibility()
         self.update_preview()
         self._append_log("已恢复默认设置")
 
@@ -695,6 +773,8 @@ class WatermarkApp(TkBase):
             self._render_preview_canvas()
         if hasattr(self, "preview_tools"):
             self.preview_tools.configure(bg=colors["preview_bg"])
+        if hasattr(self, "mode_frame"):
+            self.mode_frame.configure(bg=colors["panel"])
         if hasattr(self, "log_list"):
             self.log_list.configure(
                 bg=colors["log_bg"],
@@ -711,6 +791,7 @@ class WatermarkApp(TkBase):
                 activeforeground=colors["text"],
                 highlightbackground=colors["border"],
             )
+        self._refresh_mode_buttons()
         for checkbutton in self.checkbuttons:
             checkbutton.configure(
                 bg=colors["panel"],
@@ -727,8 +808,140 @@ class WatermarkApp(TkBase):
                 activeforeground=colors["text"],
                 highlightbackground=colors["border"],
             )
+        self._refresh_preview_tool_buttons()
+        self._refresh_settings_visibility()
         self._refresh_color_swatches()
         self._refresh_ffmpeg_badge()
+
+    def _is_remove_mode(self) -> bool:
+        return self.operation_var.get() == "remove"
+
+    def _valid_remove_regions(self) -> list[tuple[float, float, float, float]]:
+        return valid_regions(self.remove_regions)
+
+    def _remove_regions_snapshot(self) -> tuple[tuple[float, float, float, float], ...]:
+        return tuple(self._valid_remove_regions())
+
+    def _set_active_remove_region(self, index: int | None) -> None:
+        if index is None or index < 0 or index >= len(self.remove_regions):
+            self.active_remove_region_index = len(self.remove_regions) - 1 if self.remove_regions else None
+        else:
+            self.active_remove_region_index = index
+
+    def _set_operation(self, operation: str) -> None:
+        if operation not in {"watermark", "remove"}:
+            return
+        if self.operation_var.get() == operation:
+            return
+        self.operation_var.set(operation)
+        self._refresh_mode_buttons()
+        self._refresh_preview_tool_buttons()
+        self._refresh_settings_visibility()
+        if hasattr(self, "start_button"):
+            self.start_button.configure(text="开始去水印修复" if operation == "remove" else "开始加水印")
+        self.update_preview()
+
+    def _refresh_mode_buttons(self) -> None:
+        colors = self._colors()
+        active = self.operation_var.get()
+        for key, button in self.mode_buttons.items():
+            is_active = key == active
+            button.configure(
+                bg=colors["accent"] if is_active else colors["button_bg"],
+                fg="#ffffff" if is_active else colors["text"],
+                activebackground=colors["accent_hover"] if is_active else colors["button_active"],
+                activeforeground="#ffffff" if is_active else colors["text"],
+                highlightthickness=1,
+                highlightbackground=colors["accent"] if is_active else colors["border"],
+            )
+        if hasattr(self, "start_button"):
+            self.start_button.configure(text="开始去水印修复" if active == "remove" else "开始加水印")
+
+    def _refresh_settings_visibility(self) -> None:
+        groups = getattr(self, "settings_mode_widgets", None)
+        if not groups:
+            return
+        active = "remove" if self._is_remove_mode() else "watermark"
+        for mode, widgets in groups.items():
+            for widget in widgets:
+                try:
+                    if mode == active:
+                        widget.grid()
+                    else:
+                        widget.grid_remove()
+                except Exception:
+                    pass
+        if hasattr(self, "settings_canvas"):
+            self.after_idle(lambda: self.settings_canvas.configure(scrollregion=self.settings_canvas.bbox("all")))
+
+    def _clear_remove_region(self) -> None:
+        self._push_remove_region_history()
+        self.remove_regions = []
+        self.active_remove_region_index = None
+        self._remove_selecting = False
+        self._remove_select_start = None
+        self._remove_drag_action = ""
+        self._remove_drag_start_point = None
+        self._remove_drag_start_region = None
+        self._remove_drag_region_index = None
+        self._refresh_preview_tool_buttons()
+        self._render_preview_canvas()
+        if self._is_remove_mode():
+            self.update_preview()
+        self._append_log("已清除全部去水印框选区域")
+
+    def _push_remove_region_history(self) -> None:
+        current = self._remove_regions_snapshot()
+        if self.remove_region_history and self.remove_region_history[-1] == current:
+            return
+        self.remove_region_history.append(current)
+        if len(self.remove_region_history) > 30:
+            self.remove_region_history = self.remove_region_history[-30:]
+        self._refresh_preview_tool_buttons()
+
+    def _undo_remove_region(self) -> None:
+        if not self.remove_region_history:
+            self._append_log("没有可撤销的框选操作")
+            return
+        snapshot = self.remove_region_history.pop()
+        self.remove_regions = list(snapshot)
+        self._set_active_remove_region(len(self.remove_regions) - 1 if self.remove_regions else None)
+        self._remove_selecting = False
+        self._remove_select_start = None
+        self._remove_drag_action = ""
+        self._remove_drag_start_point = None
+        self._remove_drag_start_region = None
+        self._remove_drag_region_index = None
+        self._refresh_preview_tool_buttons()
+        self._render_preview_canvas()
+        if self._is_remove_mode():
+            self.update_preview()
+        self._append_log("已撤销上一次框选操作")
+
+    def _set_preview_tool(self, tool: str) -> None:
+        if tool not in {"pan", "select"}:
+            return
+        self.preview_tool_var.set(tool)
+        self._refresh_preview_tool_buttons()
+        self._render_preview_canvas()
+
+    def _refresh_preview_tool_buttons(self) -> None:
+        colors = self._colors()
+        active_tool = self.preview_tool_var.get()
+        remove_mode = self._is_remove_mode()
+        for key, button in self.preview_tool_buttons.items():
+            is_active = key == active_tool and remove_mode
+            enabled = remove_mode or key == "pan"
+            if key == "undo" and not self.remove_region_history:
+                enabled = False
+            button.configure(
+                state="normal" if enabled else "disabled",
+                bg=colors["accent"] if is_active else colors["button_bg"],
+                fg="#ffffff" if is_active else colors["text"],
+                activebackground=colors["accent_hover"] if is_active else colors["button_active"],
+                activeforeground="#ffffff" if is_active else colors["text"],
+                highlightbackground=colors["accent"] if is_active else colors["border"],
+            )
 
     def _swatch_text_color(self, color_value: str) -> str:
         normalized = self._normalize_hex_color(color_value) or "#000000"
@@ -780,6 +993,34 @@ class WatermarkApp(TkBase):
         self._render_preview_canvas()
 
     def _begin_preview_pan(self, event) -> None:
+        if self._is_remove_mode() and getattr(event, "num", 1) == 1:
+            point = self._canvas_point_to_normalized(event.x, event.y)
+            hit_index = self._remove_region_index_at_point(point) if point is not None else None
+            if point is not None and hit_index is not None:
+                self._push_remove_region_history()
+                self._remove_selecting = True
+                self._remove_drag_start_point = point
+                self._remove_drag_region_index = hit_index
+                self._set_active_remove_region(hit_index)
+                self._remove_drag_start_region = self.remove_regions[hit_index]
+                self._remove_drag_action = "move"
+                self.preview_canvas.configure(cursor="fleur")
+                self._render_preview_canvas()
+                return
+            if point is not None and self.preview_tool_var.get() == "select":
+                self._push_remove_region_history()
+                self._remove_selecting = True
+                self._remove_drag_start_point = point
+                self._remove_drag_region_index = None
+                self._remove_drag_action = "create"
+                self._remove_select_start = point
+                self.remove_regions.append((point[0], point[1], point[0], point[1]))
+                self._set_active_remove_region(len(self.remove_regions) - 1)
+                self._remove_drag_region_index = self.active_remove_region_index
+                self._remove_drag_start_region = None
+                self.preview_canvas.configure(cursor="crosshair")
+                self._render_preview_canvas()
+                return
         if self.preview_image is None or self.preview_zoom <= 1.0:
             return
         self._preview_drag_start_x = event.x
@@ -789,15 +1030,102 @@ class WatermarkApp(TkBase):
         self.preview_canvas.configure(cursor="fleur")
 
     def _pan_preview(self, event) -> None:
+        if self._remove_selecting:
+            point = self._canvas_point_to_normalized(event.x, event.y)
+            if point is None:
+                point = self._canvas_point_to_normalized(event.x, event.y, clamp=True)
+            if point is None:
+                return
+            if self._remove_drag_action == "move":
+                self._move_remove_region(point)
+            elif self._remove_select_start is not None and self._remove_drag_region_index is not None:
+                start_x, start_y = self._remove_select_start
+                self.remove_regions[self._remove_drag_region_index] = (start_x, start_y, point[0], point[1])
+            self._render_preview_canvas()
+            return
         if self.preview_image is None or self.preview_zoom <= 1.0:
             return
         self.preview_pan_x = self._preview_drag_pan_x + event.x - self._preview_drag_start_x
         self.preview_pan_y = self._preview_drag_pan_y + event.y - self._preview_drag_start_y
         self._render_preview_canvas()
 
-    def _end_preview_pan(self, _event) -> None:
+    def _end_preview_pan(self, event) -> None:
+        if self._remove_selecting:
+            self._remove_selecting = False
+            self._remove_select_start = None
+            moved = self._remove_drag_action == "move"
+            self._remove_drag_action = ""
+            self._remove_drag_start_point = None
+            self._remove_drag_start_region = None
+            changed_index = self._remove_drag_region_index
+            self._remove_drag_region_index = None
+            if changed_index is not None and changed_index < len(self.remove_regions) and has_valid_region(self.remove_regions[changed_index]):
+                self._set_active_remove_region(changed_index)
+                count = len(self._valid_remove_regions())
+                number = changed_index + 1
+                self._append_log(
+                    f"已移动第 {number} 个去水印区域；共 {count} 个区域"
+                    if moved
+                    else f"已新增第 {number} 个去水印区域；共 {count} 个区域"
+                )
+                self.update_preview()
+            else:
+                if changed_index is not None and changed_index < len(self.remove_regions):
+                    self.remove_regions.pop(changed_index)
+                self._set_active_remove_region(len(self.remove_regions) - 1 if self.remove_regions else None)
+                self._render_preview_canvas()
+            return
         if hasattr(self, "preview_canvas"):
-            self.preview_canvas.configure(cursor="fleur" if self.preview_image is not None and self.preview_zoom > 1.0 else "arrow")
+            if self.preview_image is not None and self.preview_zoom > 1.0:
+                cursor = "crosshair" if self._is_remove_mode() and self.preview_tool_var.get() == "select" else "fleur"
+            else:
+                cursor = "crosshair" if self._is_remove_mode() and self.preview_tool_var.get() == "select" else "arrow"
+            self.preview_canvas.configure(cursor=cursor)
+
+    def _canvas_point_to_normalized(self, x: int, y: int, clamp: bool = False) -> tuple[float, float] | None:
+        if self._preview_image_rect is None:
+            return None
+        left, top, width, height = self._preview_image_rect
+        if width <= 0 or height <= 0:
+            return None
+        if not clamp and (x < left or y < top or x > left + width or y > top + height):
+            return None
+        normalized_x = (x - left) / width
+        normalized_y = (y - top) / height
+        return max(0.0, min(1.0, normalized_x)), max(0.0, min(1.0, normalized_y))
+
+    def _remove_region_index_at_point(self, point: tuple[float, float]) -> int | None:
+        x, y = point
+        for index in range(len(self.remove_regions) - 1, -1, -1):
+            region = self.remove_regions[index]
+            if not has_valid_region(region):
+                continue
+            x1, y1, x2, y2 = region
+            left, right = sorted((x1, x2))
+            top, bottom = sorted((y1, y2))
+            if left <= x <= right and top <= y <= bottom:
+                return index
+        return None
+
+    def _move_remove_region(self, point: tuple[float, float]) -> None:
+        if (
+            self._remove_drag_start_point is None
+            or self._remove_drag_start_region is None
+            or self._remove_drag_region_index is None
+            or self._remove_drag_region_index >= len(self.remove_regions)
+        ):
+            return
+        start_x, start_y = self._remove_drag_start_point
+        dx = point[0] - start_x
+        dy = point[1] - start_y
+        x1, y1, x2, y2 = self._remove_drag_start_region
+        left, right = sorted((x1, x2))
+        top, bottom = sorted((y1, y2))
+        width = max(0.001, right - left)
+        height = max(0.001, bottom - top)
+        new_left = max(0.0, min(1.0 - width, left + dx))
+        new_top = max(0.0, min(1.0 - height, top + dy))
+        self.remove_regions[self._remove_drag_region_index] = (new_left, new_top, new_left + width, new_top + height)
 
     def _preview_scales(self) -> tuple[float, int, int]:
         if self.preview_image is None or not hasattr(self, "preview_canvas"):
@@ -823,14 +1151,18 @@ class WatermarkApp(TkBase):
         colors = self._colors()
         canvas = self.preview_canvas
         canvas.delete("preview_content")
+        self._preview_image_rect = None
         width = max(1, canvas.winfo_width())
         height = max(1, canvas.winfo_height())
 
         if self.preview_image is None:
+            message = getattr(self, "preview_message", "")
+            if not message:
+                message = "拖入或选择文件后可预览效果"
             canvas.create_text(
                 width / 2,
                 height / 2,
-                text=getattr(self, "preview_message", "选择一个图片或视频后可预览智能水印效果"),
+                text=message,
                 fill=colors["soft_text"],
                 font=("Microsoft YaHei UI", 10),
                 tags=("preview_content",),
@@ -845,14 +1177,103 @@ class WatermarkApp(TkBase):
             self.preview_photo = ImageTk.PhotoImage(resized)
             left = (width - scaled_width) / 2 + self.preview_pan_x
             top = (height - scaled_height) / 2 + self.preview_pan_y
+            self._preview_image_rect = (left, top, scaled_width, scaled_height)
             canvas.create_image(left, top, image=self.preview_photo, anchor="nw", tags=("preview_content",))
+            self._draw_remove_region_overlay(left, top, scaled_width, scaled_height)
             if self.preview_zoom > 1.0:
-                canvas.configure(cursor="fleur")
+                canvas.configure(cursor="crosshair" if self._is_remove_mode() and self.preview_tool_var.get() == "select" else "fleur")
             else:
-                canvas.configure(cursor="arrow")
+                canvas.configure(cursor="crosshair" if self._is_remove_mode() and self.preview_tool_var.get() == "select" else "arrow")
 
         if self.preview_toolbar_window is not None:
             canvas.tag_raise(self.preview_toolbar_window)
+
+    def _draw_remove_region_overlay(self, left: float, top: float, width: int, height: int) -> None:
+        if not self._is_remove_mode() or not hasattr(self, "preview_canvas"):
+            return
+
+        canvas = self.preview_canvas
+        colors = self._colors()
+        visible_regions = [(index, region) for index, region in enumerate(self.remove_regions) if has_valid_region(region)]
+        if visible_regions:
+            for index, region in visible_regions:
+                x1, y1, x2, y2 = region
+                rect_left = left + min(x1, x2) * width
+                rect_top = top + min(y1, y2) * height
+                rect_right = left + max(x1, x2) * width
+                rect_bottom = top + max(y1, y2) * height
+                active = index == self.active_remove_region_index
+                accent = colors["accent"] if active else colors["accent_hover"]
+                outline_width = 3 if active else 2
+                stipple = "gray25" if active else "gray12"
+                canvas.create_rectangle(
+                    rect_left,
+                    rect_top,
+                    rect_right,
+                    rect_bottom,
+                    fill=accent,
+                    stipple=stipple,
+                    outline="",
+                    tags=("preview_content",),
+                )
+                canvas.create_rectangle(
+                    rect_left,
+                    rect_top,
+                    rect_right,
+                    rect_bottom,
+                    outline=accent,
+                    width=outline_width,
+                    tags=("preview_content",),
+                )
+                label = str(index + 1)
+                label_x = min(rect_right - 10, max(rect_left + 12, rect_left + 14))
+                label_y = min(rect_bottom - 10, max(rect_top + 12, rect_top + 14))
+                canvas.create_oval(
+                    label_x - 10,
+                    label_y - 10,
+                    label_x + 10,
+                    label_y + 10,
+                    fill=accent,
+                    outline=colors["preview_bg"],
+                    width=1,
+                    tags=("preview_content",),
+                )
+                canvas.create_text(
+                    label_x,
+                    label_y,
+                    text=label,
+                    fill="#ffffff",
+                    font=("Microsoft YaHei UI", 8, "bold"),
+                    tags=("preview_content",),
+                )
+                handle = 5 if active else 4
+                for handle_x, handle_y in (
+                    (rect_left, rect_top),
+                    (rect_right, rect_top),
+                    (rect_left, rect_bottom),
+                    (rect_right, rect_bottom),
+                ):
+                    canvas.create_oval(
+                        handle_x - handle,
+                        handle_y - handle,
+                        handle_x + handle,
+                        handle_y + handle,
+                        fill=accent,
+                        outline=colors["preview_bg"],
+                        width=1,
+                        tags=("preview_content",),
+                    )
+        elif self._is_remove_mode():
+            canvas_width = max(1, canvas.winfo_width())
+            canvas_height = max(1, canvas.winfo_height())
+            canvas.create_text(
+                canvas_width / 2,
+                canvas_height - 24,
+                text="点“框选”后拖出一个或多个去水印区域；点住已有框可移动",
+                fill=colors["muted"],
+                font=("Microsoft YaHei UI", 10),
+                tags=("preview_content",),
+            )
 
     def _build_layout(self) -> None:
         colors = self._colors()
@@ -906,8 +1327,33 @@ class WatermarkApp(TkBase):
         ttk.Button(toolbar, text="添加文件夹", command=self.add_folder).grid(row=0, column=1, padx=(0, 8))
         ttk.Button(toolbar, text="移除选中", command=self.remove_selected).grid(row=0, column=2, padx=(0, 8))
         ttk.Button(toolbar, text="清空", command=self.clear_files).grid(row=0, column=3, padx=(0, 8))
+        mode_frame = Frame(toolbar, bg=colors["panel"])
+        self.mode_frame = mode_frame
+        mode_frame.grid(row=0, column=4, sticky="w", padx=(10, 10))
+        self.mode_buttons["watermark"] = Button(
+            mode_frame,
+            text="加水印",
+            command=lambda: self._set_operation("watermark"),
+            relief="flat",
+            bd=0,
+            padx=14,
+            pady=7,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        )
+        self.mode_buttons["watermark"].grid(row=0, column=0, padx=(0, 6))
+        self.mode_buttons["remove"] = Button(
+            mode_frame,
+            text="去水印",
+            command=lambda: self._set_operation("remove"),
+            relief="flat",
+            bd=0,
+            padx=14,
+            pady=7,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        )
+        self.mode_buttons["remove"].grid(row=0, column=1)
         self.file_count_label = ttk.Label(toolbar, text="已选择 0 个文件", style="Muted.TLabel")
-        self.file_count_label.grid(row=0, column=4, sticky="e")
+        self.file_count_label.grid(row=0, column=5, sticky="e")
 
         hint = ttk.Label(left, text="把图片/视频/文件夹拖到列表或预览区即可添加；也可批量选择。图片：jpg/png/webp/bmp/tiff；视频：mp4/mkv/mov/avi/wmv。", style="Muted.TLabel")
         hint.grid(row=1, column=0, sticky="w", pady=(0, 8))
@@ -946,15 +1392,21 @@ class WatermarkApp(TkBase):
         self.preview_canvas.bind("<ButtonPress-1>", self._begin_preview_pan)
         self.preview_canvas.bind("<B1-Motion>", self._pan_preview)
         self.preview_canvas.bind("<ButtonRelease-1>", self._end_preview_pan)
+        self.preview_canvas.bind("<ButtonPress-3>", self._begin_preview_pan)
+        self.preview_canvas.bind("<B3-Motion>", self._pan_preview)
+        self.preview_canvas.bind("<ButtonRelease-3>", self._end_preview_pan)
 
         preview_tools = Frame(self.preview_canvas, bg=colors["preview_bg"])
         self.preview_tools = preview_tools
         tool_specs = [
-            ("＋", lambda: self._zoom_preview(1.25), "放大预览"),
-            ("－", lambda: self._zoom_preview(0.8), "缩小预览"),
-            ("全景", self._reset_preview_view, "还原全景"),
+            ("＋", lambda: self._zoom_preview(1.25), "zoom_in"),
+            ("－", lambda: self._zoom_preview(0.8), "zoom_out"),
+            ("全景", self._reset_preview_view, "reset"),
+            ("拖图", lambda: self._set_preview_tool("pan"), "pan"),
+            ("框选", lambda: self._set_preview_tool("select"), "select"),
+            ("撤销", self._undo_remove_region, "undo"),
         ]
-        for index, (text, command, _hint) in enumerate(tool_specs):
+        for index, (text, command, key) in enumerate(tool_specs):
             button = Button(
                 preview_tools,
                 text=text,
@@ -967,13 +1419,18 @@ class WatermarkApp(TkBase):
                 bd=0,
                 highlightthickness=1,
                 highlightbackground=colors["border"],
-                padx=9,
-                pady=4,
+                width=4,
+                padx=6,
+                pady=5,
                 font=("Microsoft YaHei UI", 9, "bold"),
             )
-            button.grid(row=0, column=index, padx=(0, 6))
+            button.grid(row=index, column=0, pady=(0, 6), sticky="ew")
             self.preview_buttons.append(button)
-        self.preview_toolbar_window = self.preview_canvas.create_window(14, 14, window=preview_tools, anchor="nw")
+            if key in {"pan", "select", "undo"}:
+                self.preview_tool_buttons[key] = button
+        self.preview_toolbar_window = self.preview_canvas.create_window(12, 44, window=preview_tools, anchor="nw")
+        self._refresh_mode_buttons()
+        self._refresh_preview_tool_buttons()
         self._render_preview_canvas()
 
         log_shell = ttk.Frame(left, style="Soft.TFrame", padding=10)
@@ -1035,6 +1492,7 @@ class WatermarkApp(TkBase):
     def _build_settings(self, parent: ttk.Frame) -> None:
         colors = self._colors()
         row = 0
+        watermark_top_start = row
         ttk.Label(parent, text="水印预设", style="Section.TLabel").grid(row=row, column=0, sticky="w")
         row += 1
         preset_line = ttk.Frame(parent, style="Panel.TFrame")
@@ -1043,8 +1501,43 @@ class WatermarkApp(TkBase):
         preset_box = ttk.Combobox(preset_line, textvariable=self.preset_var, state="readonly", values=list(WATERMARK_PRESETS))
         preset_box.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         ttk.Button(preset_line, text="应用", style="Accent.TButton", command=self.apply_preset).grid(row=0, column=1)
+        watermark_top_end = row + 1
 
         row += 1
+        remove_start = row
+        ttk.Label(parent, text="去水印修复", style="Section.TLabel").grid(row=row, column=0, sticky="w")
+        row += 1
+        remove_line = ttk.Frame(parent, style="Panel.TFrame")
+        remove_line.grid(row=row, column=0, sticky="ew", pady=(6, 10))
+        remove_line.columnconfigure(0, weight=1)
+        ttk.Label(remove_line, text="可在预览图上框选多个区域", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Button(remove_line, text="清除全部", style="Accent.TButton", command=self._clear_remove_region).grid(row=0, column=1, sticky="e")
+        row += 1
+        smart_mask_check = self._register_checkbutton(Checkbutton(
+            parent,
+            text="智能只修文字/Logo 痕迹",
+            variable=self.remove_smart_mask_var,
+            command=self.update_preview,
+            bg=colors["panel"],
+            fg=colors["soft_text"],
+            activebackground=colors["panel"],
+            activeforeground=colors["text"],
+            selectcolor=colors["check_select"],
+            font=("Microsoft YaHei UI", 10),
+        ))
+        smart_mask_check.grid(row=row, column=0, sticky="w", pady=(0, 8))
+        row += 1
+        self._slider(parent, row, "识别灵敏度", self.remove_sensitivity_var, 1, 10, "级")
+        row += 1
+        self._slider(parent, row, "区域外扩", self.remove_expand_var, 0, 80, "px")
+        row += 1
+        self._slider(parent, row, "边缘柔化", self.remove_feather_var, 0, 80, "px")
+        row += 1
+        self._slider(parent, row, "修复强度", self.remove_strength_var, 1, 6, "级")
+        remove_end = row + 1
+
+        row += 1
+        watermark_detail_start = row
         ttk.Label(parent, text="水印文字", style="Section.TLabel").grid(row=row, column=0, sticky="w")
         row += 1
         ttk.Entry(parent, textvariable=self.text_var, width=34).grid(row=row, column=0, sticky="ew", pady=(6, 14))
@@ -1194,6 +1687,7 @@ class WatermarkApp(TkBase):
         self._slider(parent, row, "Logo 大小", self.logo_scale_var, 4, 35, "%")
         row += 1
         self._slider(parent, row, "Logo 间距", self.logo_gap_var, 0, 80, "px")
+        watermark_detail_end = row + 1
 
         row += 1
         ttk.Label(parent, text="输出目录", style="Section.TLabel").grid(row=row, column=0, sticky="w")
@@ -1252,6 +1746,19 @@ class WatermarkApp(TkBase):
         settings_line.columnconfigure(1, weight=1)
         ttk.Button(settings_line, text="保存设置", style="Accent.TButton", command=self._save_settings).grid(row=0, column=0, sticky="ew", padx=(0, 6))
         ttk.Button(settings_line, text="恢复默认", style="Accent.TButton", command=self._reset_settings).grid(row=0, column=1, sticky="ew")
+        watermark_rows = set(range(watermark_top_start, watermark_top_end)) | set(range(watermark_detail_start, watermark_detail_end))
+        remove_rows = set(range(remove_start, remove_end))
+        self.settings_mode_widgets = {"watermark": [], "remove": []}
+        for child in parent.winfo_children():
+            try:
+                child_row = int(child.grid_info().get("row", -1))
+            except (TypeError, ValueError):
+                continue
+            if child_row in watermark_rows:
+                self.settings_mode_widgets["watermark"].append(child)
+            elif child_row in remove_rows:
+                self.settings_mode_widgets["remove"].append(child)
+        self._refresh_settings_visibility()
 
     def _slider(self, parent: ttk.Frame, row: int, label: str, variable: IntVar, min_value: int, max_value: int, suffix: str) -> None:
         frame = ttk.Frame(parent, style="Panel.TFrame")
@@ -1298,6 +1805,22 @@ class WatermarkApp(TkBase):
             logo_path=self.logo_path_var.get().strip(),
             logo_scale=self.logo_scale_var.get(),
             logo_gap=self.logo_gap_var.get(),
+        )
+
+    def _removal_options(self) -> RemovalOptions:
+        encoder_by_label = {label: key for key, label in VIDEO_ENCODER_LABELS.items()}
+        regions = self._valid_remove_regions()
+        return RemovalOptions(
+            region=regions[-1] if regions else None,
+            regions=regions,
+            output_dir=self.output_dir_var.get().strip(),
+            image_quality=self.quality_var.get(),
+            video_encoder=encoder_by_label.get(self.video_encoder_var.get(), "auto"),
+            smart_mask=self.remove_smart_mask_var.get(),
+            mask_sensitivity=self.remove_sensitivity_var.get(),
+            feather=self.remove_feather_var.get(),
+            expand=self.remove_expand_var.get(),
+            strength=self.remove_strength_var.get(),
         )
 
     def add_files(self) -> None:
@@ -1407,23 +1930,35 @@ class WatermarkApp(TkBase):
         selected = self.tree.selection()
         if not selected:
             self.preview_token += 1
+            self.preview_source_key = None
             self.preview_image = None
             self.preview_photo = None
-            self.preview_message = "选择或拖入一个图片/视频后，可在这里查看更大的水印预览"
+            self.preview_message = (
+                "选择或拖入一个图片/视频后，可在这里框选并预览去水印修复"
+                if self._is_remove_mode()
+                else "选择或拖入一个图片/视频后，可在这里查看更大的水印预览"
+            )
             self._reset_preview_view()
             return
 
         path = Path(self.tree.item(selected[0], "values")[2])
-        options = self._watermark_options()
+        mode = self.operation_var.get()
+        source_key = (str(path.resolve()), mode)
+        reset_view = self.preview_source_key != source_key
+        self.preview_source_key = source_key
+        options = self._removal_options() if mode == "remove" else self._watermark_options()
         ffmpeg_path = self.ffmpeg_path_var.get().strip()
         max_size = self._preview_max_size()
         self.preview_token += 1
         token = self.preview_token
-        self.preview_image = None
-        self.preview_photo = None
-        self.preview_message = "正在生成预览..."
-        self._reset_preview_view()
-        self.preview_after_id = self.after(220, lambda: self._start_preview_worker(token, path, options, ffmpeg_path, max_size))
+        if reset_view or self.preview_image is None:
+            self.preview_image = None
+            self.preview_photo = None
+            self.preview_message = "正在生成去水印预览..." if mode == "remove" else "正在生成水印预览..."
+            self._reset_preview_view()
+        else:
+            self._render_preview_canvas()
+        self.preview_after_id = self.after(220, lambda: self._start_preview_worker(token, path, mode, options, ffmpeg_path, max_size, reset_view))
 
     def _preview_max_size(self) -> tuple[int, int]:
         width = self.preview_canvas.winfo_width()
@@ -1432,27 +1967,33 @@ class WatermarkApp(TkBase):
             return 1600, 1200
         return min(2600, max(900, width * 3)), min(2200, max(900, height * 3))
 
-    def _start_preview_worker(self, token: int, path: Path, options: WatermarkOptions, ffmpeg_path: str, max_size: tuple[int, int]) -> None:
+    def _start_preview_worker(self, token: int, path: Path, mode: str, options, ffmpeg_path: str, max_size: tuple[int, int], reset_view: bool) -> None:
         self.preview_after_id = None
-        thread = threading.Thread(target=self._preview_worker, args=(token, path, options, ffmpeg_path, max_size), daemon=True)
+        thread = threading.Thread(target=self._preview_worker, args=(token, path, mode, options, ffmpeg_path, max_size, reset_view), daemon=True)
         thread.start()
 
-    def _preview_worker(self, token: int, path: Path, options: WatermarkOptions, ffmpeg_path: str, max_size: tuple[int, int]) -> None:
+    def _preview_worker(self, token: int, path: Path, mode: str, options, ffmpeg_path: str, max_size: tuple[int, int], reset_view: bool) -> None:
         try:
-            if is_image_file(path):
-                preview = make_preview_image(path, options, max_size)
-            elif is_video_file(path):
-                preview = make_video_preview_image(path, ffmpeg_path, options, max_size)
+            if mode == "remove":
+                preview = make_removal_preview_image(path, ffmpeg_path, options, max_size)
                 if preview is None:
-                    self.ui_queue.put(("preview", (token, None, "视频预览需要可用的 FFmpeg")))
+                    self.ui_queue.put(("preview", (token, None, "视频去水印预览需要可用的 FFmpeg", reset_view)))
                     return
             else:
-                return
+                if is_image_file(path):
+                    preview = make_preview_image(path, options, max_size)
+                elif is_video_file(path):
+                    preview = make_video_preview_image(path, ffmpeg_path, options, max_size)
+                    if preview is None:
+                        self.ui_queue.put(("preview", (token, None, "视频预览需要可用的 FFmpeg", reset_view)))
+                        return
+                else:
+                    return
         except Exception as exc:
-            self.ui_queue.put(("preview", (token, None, f"预览失败：{exc}")))
+            self.ui_queue.put(("preview", (token, None, f"预览失败：{exc}", reset_view)))
             return
 
-        self.ui_queue.put(("preview", (token, preview, "")))
+        self.ui_queue.put(("preview", (token, preview, "", reset_view)))
 
     def start_processing(self) -> None:
         if self.worker and self.worker.is_alive():
@@ -1461,18 +2002,26 @@ class WatermarkApp(TkBase):
         if not self.files:
             messagebox.showwarning(APP_TITLE, "请先添加图片或视频文件。")
             return
-        if not self.text_var.get().strip() and not self.logo_path_var.get().strip():
+        mode = self.operation_var.get()
+        if mode == "watermark" and not self.text_var.get().strip() and not self.logo_path_var.get().strip():
             messagebox.showwarning(APP_TITLE, "请填写水印文字，或选择一个 Logo 图片。")
             return
+        if mode == "remove" and not self._valid_remove_regions():
+            messagebox.showwarning(APP_TITLE, "请先切换到去水印模式，并在预览图上拖动框选一个或多个需要修复的水印区域。")
+            return
 
-        options = self._watermark_options()
+        options = self._removal_options() if mode == "remove" else self._watermark_options()
         ffmpeg_path = self.ffmpeg_path_var.get().strip()
         self.cancel_event.clear()
         self.progress_var.set(0)
         self.status_var.set("开始处理")
         self.log_list.delete(0, END)
         self._save_settings()
-        self._append_log("开始批量处理")
+        self._append_log("开始批量去水印修复" if mode == "remove" else "开始批量加水印")
+        if getattr(options, "output_dir", ""):
+            self._append_log(f"输出目录：{Path(options.output_dir).resolve()}")
+        if mode == "remove":
+            self._append_log(describe_removal_options(options))
         if hasattr(self, "start_button"):
             self.start_button.configure(state="disabled")
         if hasattr(self, "cancel_button"):
@@ -1482,7 +2031,7 @@ class WatermarkApp(TkBase):
             values[1] = "待处理"
             self.tree.item(item, values=values)
 
-        self.worker = threading.Thread(target=self._process_worker, args=(list(self.files), options, ffmpeg_path), daemon=True)
+        self.worker = threading.Thread(target=self._process_worker, args=(list(self.files), mode, options, ffmpeg_path), daemon=True)
         self.worker.start()
 
     def cancel_processing(self) -> None:
@@ -1495,9 +2044,10 @@ class WatermarkApp(TkBase):
         else:
             self._append_log("当前没有正在运行的处理任务")
 
-    def _process_worker(self, files: list[Path], options: WatermarkOptions, ffmpeg_path: str) -> None:
+    def _process_worker(self, files: list[Path], mode: str, options, ffmpeg_path: str) -> None:
         total = len(files)
         completed = 0
+        successes = 0
         failures = 0
         cancelled = False
         for index, path in enumerate(files, start=1):
@@ -1507,15 +2057,34 @@ class WatermarkApp(TkBase):
             self.ui_queue.put(("status", (path, "处理中")))
             self.ui_queue.put(("message", f"正在处理 {index}/{total}: {path.name}"))
             try:
-                result = process_file(
-                    path,
-                    options,
-                    ffmpeg_path,
-                    lambda message: self.ui_queue.put(("message", message)),
-                    self.cancel_event.is_set,
-                )
+                if mode == "remove":
+                    result = process_removal_file(
+                        path,
+                        options,
+                        ffmpeg_path,
+                        lambda message: self.ui_queue.put(("message", message)),
+                        self.cancel_event.is_set,
+                    )
+                else:
+                    result = process_file(
+                        path,
+                        options,
+                        ffmpeg_path,
+                        lambda message: self.ui_queue.put(("message", message)),
+                        self.cancel_event.is_set,
+                    )
+                output_path = Path(result.output_path)
+                if not output_path.exists():
+                    raise RuntimeError(f"处理结束但未找到输出文件：{output_path}")
+                if output_path.stat().st_size <= 0:
+                    try:
+                        output_path.unlink()
+                    except OSError:
+                        pass
+                    raise RuntimeError(f"输出文件为空，已删除：{output_path}")
+                successes += 1
                 self.ui_queue.put(("status", (path, "完成")))
-                self.ui_queue.put(("message", f"已输出：{result.output_path} | {result.message}"))
+                self.ui_queue.put(("message", f"已输出：{output_path.resolve()} | {result.message}"))
             except Exception as exc:
                 if self.cancel_event.is_set() or str(exc) == "已取消":
                     cancelled = True
@@ -1530,7 +2099,7 @@ class WatermarkApp(TkBase):
                     self.ui_queue.put(("message", f"{path.name} 失败：{exc}"))
             completed += 1
             self.ui_queue.put(("progress", completed / total * 100))
-        self.ui_queue.put(("done", (completed, failures, cancelled)))
+        self.ui_queue.put(("done", (completed, successes, failures, cancelled)))
 
     def _drain_queue(self) -> None:
         try:
@@ -1549,24 +2118,29 @@ class WatermarkApp(TkBase):
                 elif event == "progress":
                     self.progress_var.set(float(payload))
                 elif event == "preview":
-                    token, image, message = payload
+                    if len(payload) == 4:
+                        token, image, message, reset_view = payload
+                    else:
+                        token, image, message = payload
+                        reset_view = True
                     if token != self.preview_token:
                         continue
                     if image is None:
-                        self.preview_image = None
-                        self.preview_photo = None
+                        if reset_view:
+                            self.preview_image = None
+                            self.preview_photo = None
                         self.preview_message = str(message)
-                        self._reset_preview_view()
+                        self._reset_preview_view() if reset_view else self._render_preview_canvas()
                     else:
                         self.preview_image = image.convert("RGB")
                         self.preview_message = ""
-                        self._reset_preview_view()
+                        self._reset_preview_view() if reset_view else self._render_preview_canvas()
                 elif event == "done":
-                    completed, failures, cancelled = payload
+                    completed, successes, failures, cancelled = payload
                     if cancelled:
-                        message = f"处理已取消：已处理 {completed} 个，失败 {failures} 个"
+                        message = f"处理已取消：已处理 {completed} 个，成功 {successes} 个，失败 {failures} 个"
                     else:
-                        message = f"处理完成：{completed} 个，失败 {failures} 个"
+                        message = f"处理完成：成功 {successes} 个，失败 {failures} 个"
                     self.status_var.set(message)
                     self._append_log(message)
                     if hasattr(self, "start_button"):
@@ -1574,7 +2148,7 @@ class WatermarkApp(TkBase):
                     if hasattr(self, "cancel_button"):
                         self.cancel_button.configure(state="disabled")
                     self._refresh_ffmpeg_badge()
-                    if self.open_after_var.get() and completed:
+                    if self.open_after_var.get() and successes:
                         self.open_output_dir()
         except queue.Empty:
             pass

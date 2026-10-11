@@ -1982,9 +1982,9 @@ class WatermarkApp(TkBase):
             if os.name == "nt":
                 os.startfile(str(folder))
             elif sys.platform == "darwin":
-                os.system(f'open "{folder}"')
+                subprocess.run(["open", str(folder)], check=False)
             else:
-                os.system(f'xdg-open "{folder}"')
+                subprocess.run(["xdg-open", str(folder)], check=False)
         except OSError as exc:
             messagebox.showerror(APP_TITLE, f"无法打开输出目录：{exc}")
 

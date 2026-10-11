@@ -224,7 +224,6 @@ def find_ffmpeg(preferred_path: str = "") -> str:
     app_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
     local_candidates = [
         app_dir / "ffmpeg.exe",
-        Path.cwd() / "ffmpeg.exe",
         Path(__file__).resolve().parent / "ffmpeg.exe",
         Path(r"C:\Program Files\ShareX\ffmpeg.exe"),
         Path(r"C:\Program Files\BlueStacks_msi5\ffmpeg.exe"),

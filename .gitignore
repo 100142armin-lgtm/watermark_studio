@@ -2,8 +2,11 @@ __pycache__/
 *.pyc
 output/
 watermarked/
+cleaned/
 tmp*/
 build/
 dist/
 release/
 *.spec
+.env
+*.env

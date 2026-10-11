@@ -7,7 +7,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -17,6 +19,14 @@ GITHUB_REPO = "100142armin-lgtm/watermark_studio"
 API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 RAW_VERSION_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/version.json"
 USER_AGENT = f"WatermarkStudio/{APP_VERSION}"
+
+ALLOWED_UPDATE_HOSTS = {
+    "github.com",
+    "api.github.com",
+    "raw.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "github-releases.githubusercontent.com",
+}
 
 
 @dataclass
@@ -33,20 +43,60 @@ class UpdateInfo:
     is_zip: bool = False
 
 
-def parse_version(version_str: str) -> tuple[int, ...]:
+def sanitize_version(version_str: str) -> str:
     cleaned = re.sub(r"^[^\d]*", "", str(version_str).strip())
+    match = re.search(r"^\d+(?:\.\d+)*", cleaned)
+    return match.group(0) if match else "0.0.0"
+
+
+def parse_version(version_str: str) -> tuple[int, ...]:
+    cleaned = sanitize_version(version_str)
     parts = []
     for piece in cleaned.split("."):
-        match = re.match(r"^\d+", piece)
-        if match:
-            parts.append(int(match.group()))
-        else:
+        try:
+            parts.append(int(piece))
+        except ValueError:
             break
     return tuple(parts) if parts else (0, 0, 0)
 
 
 def is_newer_version(remote_ver: str, current_ver: str = APP_VERSION) -> bool:
     return parse_version(remote_ver) > parse_version(current_ver)
+
+
+def is_safe_update_url(url: str) -> bool:
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        parsed = urllib.parse.urlparse(url.strip())
+        if parsed.scheme.lower() != "https":
+            return False
+        hostname = (parsed.hostname or "").lower()
+        if not hostname:
+            return False
+        if hostname in ALLOWED_UPDATE_HOSTS:
+            return True
+        if hostname.endswith(".github.com") or hostname.endswith(".githubusercontent.com"):
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def is_safe_zip_archive(zip_path: Path, target_dir: Path) -> bool:
+    try:
+        resolved_target = target_dir.resolve()
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            for member in zf.infolist():
+                filename = member.filename.replace("\\", "/")
+                if os.path.isabs(filename) or filename.startswith("/"):
+                    return False
+                member_path = (resolved_target / filename).resolve()
+                if not member_path.is_relative_to(resolved_target):
+                    return False
+        return True
+    except Exception:
+        return False
 
 
 def check_for_updates(timeout: int = 8) -> UpdateInfo:
@@ -66,8 +116,8 @@ def check_for_updates(timeout: int = 8) -> UpdateInfo:
         data = None
 
     if data and "tag_name" in data:
-        tag_name = data.get("tag_name", "").strip()
-        latest_ver = tag_name.lstrip("vV")
+        raw_tag = data.get("tag_name", "").strip()
+        latest_ver = sanitize_version(raw_tag)
         has_update = is_newer_version(latest_ver, current)
         title = data.get("name", "") or f"v{latest_ver}"
         description = data.get("body", "") or "暂无更新说明"
@@ -83,6 +133,8 @@ def check_for_updates(timeout: int = 8) -> UpdateInfo:
             name = asset.get("name", "")
             download_url = asset.get("browser_download_url", "")
             size = asset.get("size", 0)
+            if not is_safe_update_url(download_url):
+                continue
             if name.lower().endswith(".exe"):
                 exe_url = download_url
                 exe_size = size
@@ -131,8 +183,11 @@ def check_for_updates(timeout: int = 8) -> UpdateInfo:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             if resp.status == 200:
                 raw_info = json.loads(resp.read().decode("utf-8"))
-                latest_ver = raw_info.get("version", "").strip().lstrip("vV")
+                latest_ver = sanitize_version(raw_info.get("version", ""))
                 has_update = is_newer_version(latest_ver, current)
+                download_url = raw_info.get("exe_url", "")
+                if not is_safe_update_url(download_url):
+                    download_url = ""
                 return UpdateInfo(
                     has_update=has_update,
                     current_version=current,
@@ -140,7 +195,7 @@ def check_for_updates(timeout: int = 8) -> UpdateInfo:
                     title=raw_info.get("name", f"v{latest_ver}"),
                     description=raw_info.get("description", ""),
                     release_url=raw_info.get("release_url", f"https://github.com/{GITHUB_REPO}/releases/latest"),
-                    download_url=raw_info.get("exe_url", ""),
+                    download_url=download_url,
                     asset_name="WatermarkStudio.exe",
                     asset_size=0,
                     is_zip=False,
@@ -163,6 +218,9 @@ def download_update_file(
     progress_callback: Optional[Callable[[float, int, int], None]] = None,
     cancel_callback: Optional[Callable[[], bool]] = None,
 ) -> bool:
+    if not is_safe_update_url(download_url):
+        raise ValueError(f"安全机制拦截：拒绝从非官方受信任地址下载更新（{download_url}）")
+
     target_path.parent.mkdir(parents=True, exist_ok=True)
     temp_target = target_path.with_suffix(target_path.suffix + ".downloading")
     if temp_target.exists():
@@ -218,28 +276,50 @@ def apply_update_and_restart(new_file_path: Path, is_zip: bool = False) -> None:
     new_file = Path(new_file_path).resolve()
 
     if is_zip:
-        ps_script = (
-            f"$targetPid = {current_pid}; "
-            f"$zipPath = '{str(new_file).replace("'", "''")}'; "
-            f"$targetDir = '{str(target_dir).replace("'", "''")}'; "
-            f"$targetExe = '{str(target_exe).replace("'", "''")}'; "
-            f"Wait-Process -Id $targetPid -Timeout 20 -ErrorAction SilentlyContinue; "
-            f"Start-Sleep -Milliseconds 600; "
-            f"Expand-Archive -Path $zipPath -DestinationPath $targetDir -Force; "
-            f"Remove-Item -Path $zipPath -Force -ErrorAction SilentlyContinue; "
-            f"Start-Process -FilePath $targetExe"
+        if not is_safe_zip_archive(new_file, target_dir):
+            raise ValueError("更新压缩包检测到包含潜在路径穿越文件（Zip Slip），已中止更新以保护系统安全。")
+
+        ps_cmd = (
+            "param($pidToWait, $zip, $destDir, $exeToRun); "
+            "Wait-Process -Id $pidToWait -Timeout 20 -ErrorAction SilentlyContinue; "
+            "Start-Sleep -Milliseconds 600; "
+            "Expand-Archive -LiteralPath $zip -DestinationPath $destDir -Force; "
+            "Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue; "
+            "Start-Process -FilePath $exeToRun"
         )
+        command_args = [
+            "powershell.exe",
+            "-NoProfile",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            ps_cmd,
+            str(current_pid),
+            str(new_file),
+            str(target_dir),
+            str(target_exe),
+        ]
     else:
-        ps_script = (
-            f"$targetPid = {current_pid}; "
-            f"$src = '{str(new_file).replace("'", "''")}'; "
-            f"$dst = '{str(target_exe).replace("'", "''")}'; "
-            f"Wait-Process -Id $targetPid -Timeout 20 -ErrorAction SilentlyContinue; "
-            f"Start-Sleep -Milliseconds 600; "
-            f"Copy-Item -Path $src -Destination $dst -Force; "
-            f"Remove-Item -Path $src -Force -ErrorAction SilentlyContinue; "
-            f"Start-Process -FilePath $dst"
+        ps_cmd = (
+            "param($pidToWait, $src, $dest, $exeToRun); "
+            "Wait-Process -Id $pidToWait -Timeout 20 -ErrorAction SilentlyContinue; "
+            "Start-Sleep -Milliseconds 600; "
+            "Copy-Item -LiteralPath $src -Destination $dest -Force; "
+            "Remove-Item -LiteralPath $src -Force -ErrorAction SilentlyContinue; "
+            "Start-Process -FilePath $exeToRun"
         )
+        command_args = [
+            "powershell.exe",
+            "-NoProfile",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            ps_cmd,
+            str(current_pid),
+            str(new_file),
+            str(target_exe),
+            str(target_exe),
+        ]
 
     DETACHED_PROCESS = 0x00000008
     CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -247,7 +327,7 @@ def apply_update_and_restart(new_file_path: Path, is_zip: bool = False) -> None:
     flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
 
     subprocess.Popen(
-        ["powershell.exe", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_script],
+        command_args,
         creationflags=flags,
         close_fds=True,
     )

@@ -10,3 +10,4 @@ release/
 *.spec
 .env
 *.env
+ffmpeg.exe

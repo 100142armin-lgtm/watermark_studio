@@ -1540,7 +1540,25 @@ class WatermarkApp(TkBase):
         footer.columnconfigure(0, weight=1)
         self.progress = ttk.Progressbar(footer, variable=self.progress_var, maximum=100)
         self.progress.grid(row=0, column=0, sticky="ew", padx=(0, 12))
-        ttk.Label(footer, textvariable=self.status_var, style="Title.TLabel", font=("Microsoft YaHei UI", 9)).grid(row=0, column=1, sticky="e")
+        footer_info = ttk.Frame(footer, style="Root.TFrame")
+        footer_info.grid(row=0, column=1, sticky="e")
+        ttk.Label(footer_info, textvariable=self.status_var, style="Title.TLabel", font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(0, 14))
+        self.footer_version_label = Label(
+            footer_info,
+            text=f"v{APP_VERSION}",
+            bg=colors["button_bg"],
+            fg=colors["accent"],
+            padx=8,
+            pady=2,
+            font=("Microsoft YaHei UI", 9, "bold"),
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=colors["border"],
+            cursor="hand2",
+        )
+        self.footer_version_label.pack(side="right")
+        self.footer_version_label.bind("<Button-1>", lambda _e: self.check_updates_manual())
 
     def _build_settings(self, parent: ttk.Frame) -> None:
         colors = self._colors()
@@ -2329,6 +2347,12 @@ class WatermarkApp(TkBase):
             self.version_badge.configure(
                 bg=colors["button_bg"],
                 fg=colors["muted"],
+            )
+        if hasattr(self, "footer_version_label"):
+            self.footer_version_label.configure(
+                bg=colors["button_bg"],
+                fg=colors["accent"],
+                highlightbackground=colors["border"],
             )
         if self.downloaded_update_path and self.update_info:
             self.update_action_button.configure(

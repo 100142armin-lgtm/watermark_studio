@@ -45,6 +45,10 @@ $ModeArgs = if ($OneFile) { @("--onefile") } else { @("--onedir") }
 $IconArgs = if (Test-Path $Icon) { @("--icon", $Icon) } else { @() }
 $PathArgs = if (Test-Path $Vendor) { @("--paths", $Vendor) } else { @() }
 $AddDataArgs = if (Test-Path $Assets) { @("--add-data", "$Assets;assets") } else { @() }
+$VersionFile = Join-Path $ProjectRoot "version.json"
+if (Test-Path $VersionFile) {
+    $AddDataArgs += @("--add-data", "$VersionFile;.")
+}
 $CollectDataArgs = @()
 & $Python -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('tkinterdnd2') else 1)"
 if ($LASTEXITCODE -eq 0) {

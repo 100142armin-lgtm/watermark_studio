@@ -64,9 +64,16 @@ from remove_engine import (
     process_removal_file,
     valid_regions,
 )
+from updater import (
+    APP_VERSION,
+    UpdateInfo,
+    apply_update_and_restart,
+    check_for_updates,
+    download_update_file,
+)
 
 
-APP_TITLE = "智影水印 - 图片/视频批量水印"
+APP_TITLE = f"智影水印 v{APP_VERSION} - 图片/视频批量水印"
 ROOT_BG = "#08090d"
 PANEL_BG = "#11141a"
 SOFT_BG = "#171b23"
@@ -316,14 +323,24 @@ class WatermarkApp(TkBase):
         self.remove_feather_var = IntVar(value=16)
         self.remove_expand_var = IntVar(value=4)
         self.remove_strength_var = IntVar(value=3)
+        self.auto_check_update_var = BooleanVar(value=True)
+        self.update_info: Optional[UpdateInfo] = None
+        self.is_checking_update = False
+        self.is_downloading_update = False
+        self.update_download_cancel_event = threading.Event()
+        self.downloaded_update_path: Optional[Path] = None
+        self._update_download_percent_str = ""
 
         self._load_settings()
         self._configure_style()
         self._build_layout()
         self._apply_theme()
         self._refresh_ffmpeg_badge()
+        self._refresh_update_button()
+        self._append_log(f"智影水印 v{APP_VERSION} 启动就绪")
         self.after(120, self._drain_queue)
         self.after(200, self._enable_drag_drop)
+        self.after(2200, self._auto_check_update_on_startup)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _set_window_icon(self) -> None:
@@ -393,6 +410,7 @@ class WatermarkApp(TkBase):
             "remove_feather": self.remove_feather_var.get(),
             "remove_expand": self.remove_expand_var.get(),
             "remove_strength": self.remove_strength_var.get(),
+            "auto_check_update": self.auto_check_update_var.get(),
         }
 
     def _load_settings(self) -> None:
@@ -487,6 +505,7 @@ class WatermarkApp(TkBase):
         set_int(self.remove_feather_var, "remove_feather", 0, 80)
         set_int(self.remove_expand_var, "remove_expand", 0, 80)
         set_int(self.remove_strength_var, "remove_strength", 1, 6)
+        self.auto_check_update_var.set(bool(data.get("auto_check_update", self.auto_check_update_var.get())))
 
     def _save_settings(self) -> None:
         try:
@@ -533,9 +552,11 @@ class WatermarkApp(TkBase):
         self.remove_feather_var.set(16)
         self.remove_expand_var.set(4)
         self.remove_strength_var.set(3)
+        self.auto_check_update_var.set(True)
         self._refresh_color_swatches()
         self._apply_theme()
         self._refresh_ffmpeg_badge()
+        self._refresh_update_button()
         self._refresh_mode_buttons()
         self._refresh_settings_visibility()
         self.update_preview()
@@ -812,6 +833,7 @@ class WatermarkApp(TkBase):
         self._refresh_settings_visibility()
         self._refresh_color_swatches()
         self._refresh_ffmpeg_badge()
+        self._refresh_update_button()
 
     def _is_remove_mode(self) -> bool:
         return self.operation_var.get() == "remove"
@@ -1288,7 +1310,21 @@ class WatermarkApp(TkBase):
         header.columnconfigure(1, weight=1)
         title_block = ttk.Frame(header, style="Header.TFrame")
         title_block.grid(row=0, column=0, sticky="w")
-        ttk.Label(title_block, text="智影水印", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        title_line = ttk.Frame(title_block, style="Header.TFrame")
+        title_line.grid(row=0, column=0, sticky="w")
+        ttk.Label(title_line, text="智影水印", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        self.version_badge = Label(
+            title_line,
+            text=f"v{APP_VERSION}",
+            bg=colors["button_bg"],
+            fg=colors["muted"],
+            padx=8,
+            pady=2,
+            font=("Microsoft YaHei UI", 9, "bold"),
+            cursor="hand2",
+        )
+        self.version_badge.grid(row=0, column=1, sticky="w", padx=(10, 0), pady=(4, 0))
+        self.version_badge.bind("<Button-1>", lambda _e: self.check_updates_manual())
         ttk.Label(title_block, text="图片与视频批量智能水印工具", style="Subtitle.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 0))
         header_actions = ttk.Frame(header, style="Header.TFrame")
         header_actions.grid(row=0, column=1, sticky="e", padx=(16, 0))
@@ -1310,7 +1346,24 @@ class WatermarkApp(TkBase):
         )
         self.theme_button.grid(row=0, column=0, sticky="e", padx=(0, 8))
         self.ffmpeg_badge = Label(header_actions, text="", bg=colors["badge_ok_bg"], fg=colors["badge_ok_fg"], padx=14, pady=7, font=("Microsoft YaHei UI", 9, "bold"))
-        self.ffmpeg_badge.grid(row=0, column=1, sticky="e")
+        self.ffmpeg_badge.grid(row=0, column=1, sticky="e", padx=(0, 8))
+        self.update_action_button = Button(
+            header_actions,
+            text="检查更新",
+            command=self._on_update_button_clicked,
+            bg=colors["button_bg"],
+            fg=colors["text"],
+            activebackground=colors["button_active"],
+            activeforeground=colors["text"],
+            relief="flat",
+            bd=0,
+            highlightthickness=1,
+            highlightbackground=colors["border"],
+            padx=14,
+            pady=7,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        )
+        self.update_action_button.grid(row=0, column=2, sticky="e")
 
         left = ttk.Frame(root, style="Panel.TFrame", padding=14)
         self.left_panel = left
@@ -1739,6 +1792,29 @@ class WatermarkApp(TkBase):
         self.cancel_button = ttk.Button(parent, text="取消处理", command=self.cancel_processing)
         self.cancel_button.grid(row=row, column=0, sticky="ew", pady=(0, 14))
         self.cancel_button.configure(state="disabled")
+
+        row += 1
+        ttk.Label(parent, text="软件更新", style="Section.TLabel").grid(row=row, column=0, sticky="w", pady=(6, 0))
+        row += 1
+        update_ctrl_line = ttk.Frame(parent, style="Panel.TFrame")
+        update_ctrl_line.grid(row=row, column=0, sticky="ew", pady=(6, 8))
+        update_ctrl_line.columnconfigure(0, weight=1)
+        ttk.Label(update_ctrl_line, text=f"当前版本：v{APP_VERSION}", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Button(update_ctrl_line, text="检查更新", style="Accent.TButton", command=self.check_updates_manual).grid(row=0, column=1, sticky="e")
+        row += 1
+        auto_update_check = self._register_checkbutton(Checkbutton(
+            parent,
+            text="启动时自动检查更新",
+            variable=self.auto_check_update_var,
+            bg=colors["panel"],
+            fg=colors["soft_text"],
+            activebackground=colors["panel"],
+            activeforeground=colors["text"],
+            selectcolor=colors["check_select"],
+            font=("Microsoft YaHei UI", 10),
+        ))
+        auto_update_check.grid(row=row, column=0, sticky="w", pady=(0, 12))
+
         row += 1
         settings_line = ttk.Frame(parent, style="Panel.TFrame")
         settings_line.grid(row=row, column=0, sticky="ew", pady=(0, 0))
@@ -2150,6 +2226,43 @@ class WatermarkApp(TkBase):
                     self._refresh_ffmpeg_badge()
                     if self.open_after_var.get() and successes:
                         self.open_output_dir()
+                elif event == "update_check_result":
+                    info, manual, error = payload
+                    self.is_checking_update = False
+                    if error:
+                        self._refresh_update_button()
+                        if manual:
+                            messagebox.showwarning(APP_TITLE, f"检查更新失败：{error}\n请检查网络连接。")
+                        continue
+                    self.update_info = info
+                    self._refresh_update_button()
+                    if info and info.has_update:
+                        self._append_log(f"发现新版本：v{info.latest_version}（当前：v{APP_VERSION}）")
+                        if manual:
+                            self._prompt_start_download()
+                        else:
+                            if getattr(sys, "frozen", False) and info.download_url:
+                                self._start_silent_download(info)
+                            else:
+                                self._append_log("可点击右上角【发现新版】进行更新。")
+                    else:
+                        if manual:
+                            messagebox.showinfo(APP_TITLE, f"当前已是最新版本 (v{APP_VERSION})！")
+                elif event == "update_download_progress":
+                    percent = float(payload)
+                    self._update_download_percent_str = f"下载中 {int(percent)}%"
+                    self._refresh_update_button()
+                elif event == "update_download_done":
+                    target_path, info = payload
+                    self.is_downloading_update = False
+                    self.downloaded_update_path = target_path
+                    self._refresh_update_button()
+                    self._append_log(f"新版本 v{info.latest_version} 已静默下载完毕，点击右上角【重启更新】即可生效。")
+                elif event == "update_download_fail":
+                    error_msg = str(payload)
+                    self.is_downloading_update = False
+                    self._refresh_update_button()
+                    self._append_log(f"新版本下载未完成：{error_msg}")
         except queue.Empty:
             pass
         self.after(120, self._drain_queue)
@@ -2208,11 +2321,189 @@ class WatermarkApp(TkBase):
         else:
             self.ffmpeg_badge.configure(text="FFmpeg 未找到：图片可用，视频需选择 ffmpeg.exe", bg=colors["badge_warn_bg"], fg=colors["badge_warn_fg"])
 
+    def _refresh_update_button(self) -> None:
+        if not hasattr(self, "update_action_button"):
+            return
+        colors = self._colors()
+        if hasattr(self, "version_badge"):
+            self.version_badge.configure(
+                bg=colors["button_bg"],
+                fg=colors["muted"],
+            )
+        if self.downloaded_update_path and self.update_info:
+            self.update_action_button.configure(
+                text=f"✅ 重启更新 v{self.update_info.latest_version}",
+                bg=colors["badge_ok_bg"],
+                fg=colors["badge_ok_fg"],
+                activebackground=colors["badge_ok_bg"],
+                activeforeground=colors["badge_ok_fg"],
+                highlightbackground=colors["badge_ok_fg"],
+            )
+        elif self.is_downloading_update:
+            percent_str = self._update_download_percent_str or "下载中..."
+            self.update_action_button.configure(
+                text=percent_str,
+                bg=colors["button_bg"],
+                fg=colors["accent"],
+                activebackground=colors["button_active"],
+                activeforeground=colors["accent"],
+                highlightbackground=colors["accent"],
+            )
+        elif self.is_checking_update:
+            self.update_action_button.configure(
+                text="检查中...",
+                bg=colors["button_bg"],
+                fg=colors["muted"],
+                activebackground=colors["button_bg"],
+                activeforeground=colors["muted"],
+                highlightbackground=colors["border"],
+            )
+        elif self.update_info and self.update_info.has_update:
+            self.update_action_button.configure(
+                text=f"🌟 发现新版 v{self.update_info.latest_version}",
+                bg=colors["accent"],
+                fg="#ffffff",
+                activebackground=colors["accent_hover"],
+                activeforeground="#ffffff",
+                highlightbackground=colors["accent"],
+            )
+        else:
+            self.update_action_button.configure(
+                text="检查更新",
+                bg=colors["button_bg"],
+                fg=colors["text"],
+                activebackground=colors["button_active"],
+                activeforeground=colors["text"],
+                highlightbackground=colors["border"],
+            )
+
+    def _on_update_button_clicked(self) -> None:
+        if self.downloaded_update_path and self.update_info:
+            self._prompt_apply_update()
+            return
+        if self.is_downloading_update:
+            messagebox.showinfo(APP_TITLE, "新版本安装包正在后台静默下载中，请稍候...")
+            return
+        if self.update_info and self.update_info.has_update:
+            self._prompt_start_download()
+            return
+        self.check_updates_manual()
+
+    def check_updates_manual(self) -> None:
+        self._check_updates_async(manual=True)
+
+    def _auto_check_update_on_startup(self) -> None:
+        if not self.auto_check_update_var.get():
+            return
+        self._check_updates_async(manual=False)
+
+    def _check_updates_async(self, manual: bool) -> None:
+        if self.is_checking_update or self.is_downloading_update:
+            if manual:
+                messagebox.showinfo(APP_TITLE, "正在检查或下载更新中，请稍候...")
+            return
+        self.is_checking_update = True
+        self._refresh_update_button()
+
+        def worker():
+            try:
+                info = check_for_updates()
+                self.ui_queue.put(("update_check_result", (info, manual, None)))
+            except Exception as exc:
+                self.ui_queue.put(("update_check_result", (None, manual, str(exc))))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _start_silent_download(self, info: UpdateInfo) -> None:
+        if self.is_downloading_update or not info.download_url:
+            return
+        self.is_downloading_update = True
+        self.update_download_cancel_event.clear()
+        self._update_download_percent_str = "下载中 0%"
+        self._refresh_update_button()
+        self._append_log(f"开始后台静默下载新版本 v{info.latest_version}...")
+
+        def download_worker():
+            try:
+                import tempfile
+                temp_dir = Path(tempfile.gettempdir()) / "WatermarkStudio_Update"
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                ext = ".zip" if info.is_zip else ".exe"
+                target_path = temp_dir / f"WatermarkStudio_v{info.latest_version}{ext}"
+
+                last_report = [0.0]
+
+                def on_progress(percent, _down, _tot):
+                    if time.monotonic() - last_report[0] > 0.35 or percent >= 100:
+                        last_report[0] = time.monotonic()
+                        self.ui_queue.put(("update_download_progress", percent))
+
+                success = download_update_file(
+                    info.download_url,
+                    target_path,
+                    progress_callback=on_progress,
+                    cancel_callback=self.update_download_cancel_event.is_set,
+                )
+                if success:
+                    self.ui_queue.put(("update_download_done", (target_path, info)))
+                else:
+                    self.ui_queue.put(("update_download_fail", "下载被取消或未成功"))
+            except Exception as exc:
+                self.ui_queue.put(("update_download_fail", str(exc)))
+
+        threading.Thread(target=download_worker, daemon=True).start()
+
+    def _prompt_start_download(self) -> None:
+        if not self.update_info:
+            return
+        if not getattr(sys, "frozen", False):
+            if messagebox.askyesno(
+                APP_TITLE,
+                f"发现新版本 v{self.update_info.latest_version}！\n\n"
+                f"更新说明：\n{self.update_info.description}\n\n"
+                f"当前在源码模式下运行，是否打开 GitHub Release 页面查看？",
+            ):
+                import webbrowser
+                webbrowser.open(self.update_info.release_url)
+            return
+
+        if messagebox.askyesno(
+            APP_TITLE,
+            f"发现新版本 v{self.update_info.latest_version}！\n\n"
+            f"更新说明：\n{self.update_info.description}\n\n"
+            f"是否立即在后台静默下载？（不影响您当前的操作）",
+        ):
+            self._start_silent_download(self.update_info)
+
+    def _prompt_apply_update(self) -> None:
+        if not self.downloaded_update_path or not self.update_info:
+            return
+        if self.worker and self.worker.is_alive():
+            messagebox.showwarning(APP_TITLE, "当前正在进行批量处理任务，请等待处理完成后再重启更新。")
+            return
+        if messagebox.askyesno(
+            APP_TITLE,
+            f"智影水印新版本 (v{self.update_info.latest_version}) 已下载就绪！\n\n"
+            f"点击【是】将立即退出并重启应用新版本；\n"
+            f"点击【否】可稍后重启。",
+        ):
+            self._save_settings()
+            apply_update_and_restart(self.downloaded_update_path, is_zip=self.update_info.is_zip)
+
     def _on_close(self) -> None:
         if self.worker and self.worker.is_alive():
             if not messagebox.askyesno(APP_TITLE, "任务仍在处理中，要取消并退出吗？"):
                 return
             self.cancel_event.set()
+
+        if self.is_downloading_update:
+            self.update_download_cancel_event.set()
+
+        if self.downloaded_update_path and self.update_info and not (self.worker and self.worker.is_alive()):
+            if messagebox.askyesno(APP_TITLE, f"新版本 v{self.update_info.latest_version} 已下载完毕，退出时是否顺便重启更新？"):
+                self._save_settings()
+                apply_update_and_restart(self.downloaded_update_path, is_zip=self.update_info.is_zip)
+                return
 
         self._save_settings()
         if os.name == "nt" and self._drop_old_wndprocs:
